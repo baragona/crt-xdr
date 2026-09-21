@@ -28,6 +28,11 @@ struct U {
     float4 maskp;   // type, strength, comp, unused
     float4 geo;     // curvature, cornerR, vignette, margin
     float4 light;   // peak, brightness, halation, unused
+    float4 cm0;     // phosphor chromaticity matrix, column 0
+    float4 cm1;     // column 1
+    float4 cm2;     // column 2
+    float4 phys;    // convergence px, gamma ratio, cylindrical factor, interlace
+    float4 taus;    // per-phosphor decay time constants (s), w unused
 };
 
 vertex float4 vs(uint vid [[vertex_id]]) {
@@ -43,16 +48,20 @@ fragment float4 fsPersist(float4 fc [[position]],
                           sampler smp [[sampler(0)]]) {
     float2 suv = fc.xy / u.sizes.zw;
     float3 s = src.sample(smp, suv, level(0)).rgb;
+    // gun nonlinearity: signal mastered for ~2.2, tube EOTF ~2.4 (Poynton)
+    s = pow(max(s, 0.0), float3(u.phys.y));
+    // render through real phosphor chromaticities (SMPTE-C etc., CPU-built)
+    s = float3x3(u.cm0.xyz, u.cm1.xyz, u.cm2.xyz) * s;
     float3 pr = prev.sample(smp, suv, level(0)).rgb;
-    float tau = max(u.beam.w, 0.0005);
-    float decay = exp(-u.timing.y / tau);
+    // per-phosphor decay: red Y2O2S:Eu lags the green/blue sulfides
+    float3 decay = exp(-u.timing.y / max(u.taus.xyz, float3(2e-5)));
     float3 fresh = s;
     if (u.timing.z > 0.5) {
         float phase  = fract(u.timing.x * 60.0);          // beam y, 0..1
         float sweep  = clamp(u.timing.y * 60.0, 0.0, 1.0); // swept this frame
         float behind = fract(phase - suv.y);
         float lit = behind < sweep ? 1.0 : 0.0;
-        float boost = clamp(1.0 / (60.0 * tau), 1.0, 4.0); // short glow, hot beam
+        float boost = clamp(1.0 / (60.0 * max(u.taus.y, 2e-5)), 1.0, 4.0);
         fresh = s * lit * boost;
     }
     return float4(max(fresh, pr * decay), 1.0);
@@ -67,7 +76,7 @@ static float3 blur9(float2 dir, float2 fc, constant U &u,
     float3 acc = 0.0; float tot = 0.0;
     for (int i = -3; i <= 3; i++) {
         float wi = w[abs(i)];
-        acc += t.sample(smp, suv + px * float(i) * 1.5, level(0)).rgb * wi;
+        acc += t.sample(smp, suv + px * float(i) * 2.6, level(0)).rgb * wi;
         tot += wi;
     }
     return acc / tot;
@@ -123,10 +132,11 @@ fragment float4 fsComposite(float4 fc [[position]],
     if (A > T) { c.x = p.x * A / T; } else { c.y = p.y * T / A; }
     c /= u.geo.w;
 
-    // barrel curvature
+    // barrel curvature. Trinitron (grille) tubes are cylindrical — curved
+    // horizontally, flat vertically — so phys.z suppresses the vertical bow.
     float k = u.geo.x;
     float2 q = float2(c.x * (1.0 + k * c.y * c.y),
-                      c.y * (1.0 + k * 1.3 * c.x * c.x));
+                      c.y * (1.0 + k * 1.3 * c.x * c.x * u.phys.z));
 
     // rounded-rect tube edge (SDF, antialiased) — derivatives before branching
     float r = u.geo.y;
@@ -144,16 +154,30 @@ fragment float4 fsComposite(float4 fc [[position]],
     float f  = clamp((sx - x0 - 0.5) * u.beam.z + 0.5, 0.0, 1.0);
     float ux = (x0 + 0.5 + f) / srcSize.x;
 
+    // interlace (480i): odd/even fields sit half a source line apart at 60Hz
+    float off = 0.0;
+    if (u.phys.w > 0.5) {
+        float par = fmod(floor(u.timing.x * 60.0), 2.0);
+        off = par * 0.5 - 0.25;
+    }
+
+    // misconvergence: R and B rasters splay horizontally, zero at center,
+    // growing linearly toward the edges (pincushion-model radial error)
+    float convU = u.phys.x * q.x / srcSize.x;
+
     // vertical: gaussian electron beam over the two nearest scanlines.
     // brighter -> wider; energy-normalized so a narrow beam peaks >1.0 (EDR)
     float H = srcSize.y;
-    float fy = suv.y * H - 0.5;
+    float fy = suv.y * H - 0.5 - off;
     float l0 = floor(fy);
     float3 col = 0.0;
     for (int i = 0; i < 2; i++) {
         float l = l0 + float(i);
         float inR = (l >= -0.5 && l <= H - 0.5) ? 1.0 : 0.0;
-        float3 s = persistT.sample(smp, float2(ux, (l + 0.5) / H), level(0)).rgb;
+        float vv = (l + 0.5 + off) / H;
+        float3 s = float3(persistT.sample(smp, float2(ux + convU, vv), level(0)).r,
+                          persistT.sample(smp, float2(ux, vv), level(0)).g,
+                          persistT.sample(smp, float2(ux - convU, vv), level(0)).b);
         float lum = clamp(dot(s, float3(0.299, 0.587, 0.114)), 0.0, 1.0);
         float sigma = mix(u.beam.x, u.beam.y, lum);
         float dd = fy - l;
@@ -214,8 +238,12 @@ final class Params {
     var sigMin: Float = 0.30
     var sigMax: Float = 0.55
     var sharp: Float = 2.5
-    var halation: Float = 0.07
-    var tauMs: Float = 8.0
+    var halation: Float = 0.05
+    var decayScale: Float = 1.0  // × real P22 time constants
+    var conv: Float = 0.35       // R/B misconvergence at screen edge, source px
+    var gammaC: Float = 2.4      // tube EOTF exponent (signal assumed 2.2)
+    var phosphor: Int = 1        // 0 sRGB, 1 SMPTE-C D65, 2 SMPTE-C 9300K
+    var interlace: Bool = false
     var curv: Float = 0.03
     var testStrip: Bool = false
     var corner: Float = 0.06
@@ -477,14 +505,42 @@ final class Renderer: NSObject, MTKViewDelegate {
         let s = params.maskStrength
         let maskAvg: Float = [1.0, 1.0 / 3.0, 1.0 / 3.0, 0.2667, 0.2667][params.maskType]
         let comp = 1.0 / (1.0 - s * (1.0 - maskAvg))
+
+        // Phosphor chromaticity -> sRGB matrices (row-major), derived from
+        // SMPTE-C primaries R(.630,.340) G(.310,.595) B(.155,.070) with D65
+        // or 9300K+8MPCD (x .2831, y .2971) white. SMPTE-C luma weights come
+        // out .2124/.7011/.0866, matching the published coefficients.
+        let mIdent: [Float] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        let mSmpteC: [Float] = [0.9390, 0.0502, 0.0102,
+                                0.0179, 0.9659, 0.0164,
+                               -0.0016, -0.0044, 1.0060]
+        let mSmpte93: [Float] = [0.7808, 0.0508, 0.0137,
+                                 0.0149, 0.9746, 0.0220,
+                                -0.0013, -0.0044, 1.3483]
+        let m = params.phosphor == 1 ? mSmpteC : (params.phosphor == 2 ? mSmpte93 : mIdent)
+
+        // P22 decay time constants (1/e, seconds): red Y2O2S:Eu ~1ms is the
+        // slow one; green/blue sulfides are a few hundred microseconds.
+        let tauR = 0.0010 * params.decayScale
+        let tauG = 0.00025 * params.decayScale
+        let tauB = 0.00010 * params.decayScale
+
+        // Trinitron grille tubes are cylindrical: no vertical curvature
+        let cyl: Float = (params.maskType == 1 || params.maskType == 2) ? 0.12 : 1.0
+
         var u: [Float] = [
             Float(view.drawableSize.width), Float(view.drawableSize.height), Float(SW), Float(SH),
             Float(now.truncatingRemainder(dividingBy: 3600)), dt, params.rolling ? 1 : 0,
             params.testStrip ? 1 : 0,
-            params.sigMin, max(params.sigMax, params.sigMin + 0.01), params.sharp, params.tauMs / 1000,
+            params.sigMin, max(params.sigMax, params.sigMin + 0.01), params.sharp, 0,
             Float(params.maskType), s, comp, 0,
             params.curv, params.corner, params.vig, 0.94,
             min(params.peak, max(headroom, 1.0)), params.bright, params.halation, 0,
+            m[0], m[3], m[6], 0,       // matrix column 0
+            m[1], m[4], m[7], 0,       // column 1
+            m[2], m[5], m[8], 0,       // column 2
+            params.conv, params.gammaC / 2.2, cyl, params.interlace ? 1 : 0,
+            tauR, tauG, tauB, 0,
         ]
 
         guard let drawable = view.currentDrawable,
@@ -500,7 +556,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
             guard let e = cmd.makeRenderCommandEncoder(descriptor: rp) else { return }
             e.setRenderPipelineState(p)
-            e.setFragmentBytes(&u, length: 24 * 4, index: 0)
+            e.setFragmentBytes(&u, length: 44 * 4, index: 0)
             e.setFragmentSamplerState(sampler, index: 0)
             for (i, t) in textures.enumerated() { e.setFragmentTexture(t, index: i) }
             e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -535,6 +591,7 @@ final class CRTView: MTKView {
         case "4": params.scene = 3
         case "r": params.rolling.toggle()
         case "t": params.testStrip.toggle()
+        case "i": params.interlace.toggle()
         case "m": params.maskType = (params.maskType + 1) % 5
         case "f": window?.toggleFullScreen(nil)
         case "h": AppController.shared?.panel.setIsVisible(!(AppController.shared?.panel.isVisible ?? true))
@@ -571,6 +628,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     var maskPopup: NSPopUpButton!
     var rollingCheck: NSButton!
     var testCheck: NSButton!
+    var interlaceCheck: NSButton!
+    var phosphorPopup: NSPopUpButton!
     var sliderActions: [SliderAction] = []
 
     final class SliderAction: NSObject {
@@ -645,6 +704,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         maskPopup = popupRow("mask", ["none", "grille 0.3mm", "grille 0.6mm", "slot 0.3mm", "slot 0.6mm"],
                              params.maskType == 0 ? 0 : params.maskType,
                              #selector(maskChanged(_:)))
+        phosphorPopup = popupRow("phosphors", ["sRGB (modern)", "SMPTE-C (D65)", "SMPTE-C 9300K"],
+                                 params.phosphor, #selector(phosphorChanged(_:)))
 
         func slider(_ label: String, _ min: Float, _ max: Float, _ value: Float,
                     _ set: @escaping (Float) -> Void) {
@@ -671,7 +732,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         slider("beam max s", 0.20, 1.00, params.sigMax) { params.sigMax = $0 }
         slider("h sharpness", 1, 4, params.sharp) { params.sharp = $0 }
         slider("halation", 0, 0.5, params.halation) { params.halation = $0 }
-        slider("phosphor ms", 1, 60, params.tauMs) { params.tauMs = $0 }
+        slider("decay scale x", 0.1, 10, params.decayScale) { params.decayScale = $0 }
+        slider("convergence", 0, 1.5, params.conv) { params.conv = $0 }
+        slider("CRT gamma", 2.2, 2.6, params.gammaC) { params.gammaC = $0 }
         slider("curvature", 0, 0.25, params.curv) { params.curv = $0 }
         slider("corner r", 0.01, 0.2, params.corner) { params.corner = $0 }
         slider("vignette", 0, 0.8, params.vig) { params.vig = $0 }
@@ -681,6 +744,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         rollingCheck.state = params.rolling ? .on : .off
         rollingCheck.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         stack.addArrangedSubview(rollingCheck)
+
+        interlaceCheck = NSButton(checkboxWithTitle: "interlace (480i twitter)",
+                                  target: self, action: #selector(interlaceChanged(_:)))
+        interlaceCheck.state = params.interlace ? .on : .off
+        interlaceCheck.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        stack.addArrangedSubview(interlaceCheck)
 
         testCheck = NSButton(checkboxWithTitle: "EDR test strip (1x 2x 4x max)",
                              target: self, action: #selector(testChanged(_:)))
@@ -724,6 +793,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc func maskChanged(_ p: NSPopUpButton) { params.maskType = p.indexOfSelectedItem }
     @objc func rollingChanged(_ b: NSButton) { params.rolling = b.state == .on }
     @objc func testChanged(_ b: NSButton) { params.testStrip = b.state == .on }
+    @objc func interlaceChanged(_ b: NSButton) { params.interlace = b.state == .on }
+    @objc func phosphorChanged(_ p: NSPopUpButton) { params.phosphor = p.indexOfSelectedItem }
 
     func syncControls() {
         scenePopup.selectItem(at: params.scene)
