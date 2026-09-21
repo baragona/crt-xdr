@@ -91,30 +91,51 @@ fragment float4 fsBlurV(float4 fc [[position]], constant U &u [[buffer(0)]],
 }
 
 // ---- final composite at full Retina resolution -------------------------------
-static float3 maskPattern(uint fx, uint fy, int t) {
-    if (t == 1) {                       // aperture grille: 3 device px ~ 0.30mm triad
-        uint p = fx % 3u;
-        return float3(p == 0u ? 1.0 : 0.0, p == 1u ? 1.0 : 0.0, p == 2u ? 1.0 : 0.0);
+static float hash13(uint3 v) {
+    uint n = v.x * 1597334673u ^ v.y * 3812015801u ^ v.z * 2798796415u;
+    n = (n ^ (n >> 16)) * 2246822519u;
+    n = n ^ (n >> 13);
+    return float(n & 0xFFFFFFu) / 16777215.0;
+}
+
+struct MaskS { float3 w; float cellDy; };
+
+// Phosphor structure modeled on macro photography of real tubes: soft-edged
+// deposition (not hard rectangles), powder grain per cell, and for slot masks
+// discrete rounded pills in a staggered brick layout.
+static MaskS maskEval(float2 fcxy, int t, float grain) {
+    MaskS o; o.w = float3(1.0); o.cellDy = 0.0;
+    if (t == 0) { return o; }
+    int scale = (t == 2 || t == 4) ? 2 : 1;
+    float fs = float(scale);
+    int xi = int(fcxy.x);
+    int p = (xi / scale) % 3;
+    float3 sel = float3(p == 0 ? 1.0 : 0.0, p == 1 ? 1.0 : 0.0, p == 2 ? 1.0 : 0.0);
+    // lateral deposition profile: gaussian-soft stripe edges
+    float cx = (floor(fcxy.x / fs) + 0.5) * fs;
+    float dx = fcxy.x - cx;
+    float sig = 0.42 * fs;
+    float lat = exp(-dx * dx / (2.0 * sig * sig));
+    if (t <= 2) {                       // aperture grille: continuous stripes
+        float g = 1.0 + grain * (hash13(uint3(uint(xi / scale),
+                                              uint(int(fcxy.y) / (4 * scale)), uint(p))) - 0.5);
+        o.w = sel * lat * g;
+        return o;
     }
-    if (t == 2) {                       // coarse grille: 6 device px triad
-        uint p = (fx / 2u) % 3u;
-        return float3(p == 0u ? 1.0 : 0.0, p == 1u ? 1.0 : 0.0, p == 2u ? 1.0 : 0.0);
-    }
-    if (t == 3) {                       // slot mask, 3 device px triad
-        uint p = fx % 3u;
-        uint col = (fx / 3u) % 2u;
-        uint yy = (fy + col * 2u) % 4u;
-        float slot = yy == 0u ? 0.2 : 1.0;
-        return float3(p == 0u ? 1.0 : 0.0, p == 1u ? 1.0 : 0.0, p == 2u ? 1.0 : 0.0) * slot;
-    }
-    if (t == 4) {                       // coarse slot mask, 6 device px triad
-        uint p = (fx / 2u) % 3u;
-        uint col = (fx / 6u) % 2u;
-        uint yy = (fy + col * 4u) % 8u;
-        float slot = yy < 2u ? 0.2 : 1.0;
-        return float3(p == 0u ? 1.0 : 0.0, p == 1u ? 1.0 : 0.0, p == 2u ? 1.0 : 0.0) * slot;
-    }
-    return float3(1.0);
+    // slot mask: rounded phosphor pills, alternate columns offset half a period
+    float P = 4.0 * fs;
+    int triad = xi / (3 * scale);
+    float yoff = float(triad % 2) * (P * 0.5);
+    float ypos = fcxy.y + yoff;
+    float cellRow = floor(ypos / P);
+    float dyC = ypos - (cellRow + 0.5) * P;
+    float hh = 0.5 * (P - fs);          // pill half-height; webbing one stripe wide
+    float vert = 1.0 - smoothstep(hh - 0.5, hh + 0.5, fabs(dyC));
+    float g = 1.0 + grain * (hash13(uint3(uint(triad),
+                                          uint(int(cellRow) & 0x7fffffff), uint(p))) - 0.5);
+    o.w = sel * lat * vert * g;
+    o.cellDy = -dyC;                    // pills glow as units: beam sampled at cell center
+    return o;
 }
 
 fragment float4 fsComposite(float4 fc [[position]],
@@ -165,10 +186,16 @@ fragment float4 fsComposite(float4 fc [[position]],
     // growing linearly toward the edges (pincushion-model radial error)
     float convU = u.phys.x * q.x / srcSize.x;
 
+    // phosphor mask; slot-mask pills integrate the beam, so the scanline
+    // field is evaluated at the pill center rather than per fragment
+    int mt = int(u.maskp.x);
+    MaskS mk = maskEval(fc.xy, mt, u.maskp.w);
+    float suvY = suv.y + dfdy(suv.y) * mk.cellDy;
+
     // vertical: gaussian electron beam over the two nearest scanlines.
     // brighter -> wider; energy-normalized so a narrow beam peaks >1.0 (EDR)
     float H = srcSize.y;
-    float fy = suv.y * H - 0.5 - off;
+    float fy = suvY * H - 0.5 - off;
     float l0 = floor(fy);
     float3 col = 0.0;
     for (int i = 0; i < 2; i++) {
@@ -185,9 +212,18 @@ fragment float4 fsComposite(float4 fc [[position]],
         col += s * w;
     }
 
-    // phosphor mask in device pixels + energy compensation into EDR headroom
-    float3 m = maskPattern(uint(fc.x), uint(fc.y), int(u.maskp.x));
-    col *= mix(float3(1.0), m, u.maskp.y) * u.maskp.z;
+    // apply mask + energy compensation into EDR headroom
+    col *= mix(float3(1.0), mk.w, u.maskp.y) * u.maskp.z;
+
+    // Trinitron damper wires: fine horizontal shadow wires at 1/3 and 2/3
+    if (mt == 1 || mt == 2) {
+        float fq = max(fwidth(q.y), 1e-6);
+        for (int wi = 0; wi < 2; wi++) {
+            float yw = wi == 0 ? -0.3333 : 0.3333;
+            float dpx = (q.y - yw) / fq;
+            col *= 1.0 - 0.35 * u.maskp.y * exp(-dpx * dpx / 3.0);
+        }
+    }
 
     // halation
     col += blurT.sample(smp, suv, level(0)).rgb * u.light.z;
@@ -235,6 +271,7 @@ final class Params {
     var bright: Float = 0.9
     var maskType: Int = 2        // grille 0.6mm
     var maskStrength: Float = 1.0
+    var grain: Float = 0.10      // phosphor powder grain, per-cell variation
     var sigMin: Float = 0.30
     var sigMax: Float = 0.55
     var sharp: Float = 2.5
@@ -503,7 +540,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                        withBytes: painter.ctx.data!, bytesPerRow: SW * 4)
 
         let s = params.maskStrength
-        let maskAvg: Float = [1.0, 1.0 / 3.0, 1.0 / 3.0, 0.2667, 0.2667][params.maskType]
+        // per-channel spatial averages of the soft-profile masks (lateral
+        // gaussian avg ~0.807, slot pill vertical duty ~0.75)
+        let maskAvg: Float = [1.0, 0.269, 0.269, 0.202, 0.202][params.maskType]
         let comp = 1.0 / (1.0 - s * (1.0 - maskAvg))
 
         // Phosphor chromaticity -> sRGB matrices (row-major), derived from
@@ -533,7 +572,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             Float(now.truncatingRemainder(dividingBy: 3600)), dt, params.rolling ? 1 : 0,
             params.testStrip ? 1 : 0,
             params.sigMin, max(params.sigMax, params.sigMin + 0.01), params.sharp, 0,
-            Float(params.maskType), s, comp, 0,
+            Float(params.maskType), s, comp, params.grain,
             params.curv, params.corner, params.vig, 0.94,
             min(params.peak, max(headroom, 1.0)), params.bright, params.halation, 0,
             m[0], m[3], m[6], 0,       // matrix column 0
@@ -728,6 +767,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         slider("peak limit x", 1, 8, params.peak) { params.peak = $0 }
         slider("brightness", 0.2, 2.5, params.bright) { params.bright = $0 }
         slider("mask strength", 0, 1, params.maskStrength) { params.maskStrength = $0 }
+        slider("grain", 0, 0.3, params.grain) { params.grain = $0 }
         slider("beam min s", 0.10, 0.60, params.sigMin) { params.sigMin = $0 }
         slider("beam max s", 0.20, 1.00, params.sigMax) { params.sigMax = $0 }
         slider("h sharpness", 1, 4, params.sharp) { params.sharp = $0 }
