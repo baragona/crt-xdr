@@ -259,7 +259,7 @@ fragment float4 fsComposite(float4 fc [[position]],
 final class Params {
     var peak: Float = 8.0        // × SDR white
     var bright: Float = 0.9
-    var maskType: Int = 2        // grille 0.6mm
+    var maskType: Int = 4        // slot 0.6mm
     var maskStrength: Float = 1.0
     var grain: Float = 0.10      // phosphor powder grain, per-cell variation
     var sigMin: Float = 0.30
