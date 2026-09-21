@@ -215,16 +215,6 @@ fragment float4 fsComposite(float4 fc [[position]],
     // apply mask + energy compensation into EDR headroom
     col *= mix(float3(1.0), mk.w, u.maskp.y) * u.maskp.z;
 
-    // Trinitron damper wires: fine horizontal shadow wires at 1/3 and 2/3
-    if (mt == 1 || mt == 2) {
-        float fq = max(fwidth(q.y), 1e-6);
-        for (int wi = 0; wi < 2; wi++) {
-            float yw = wi == 0 ? -0.3333 : 0.3333;
-            float dpx = (q.y - yw) / fq;
-            col *= 1.0 - 0.35 * u.maskp.y * exp(-dpx * dpx / 3.0);
-        }
-    }
-
     // halation
     col += blurT.sample(smp, suv, level(0)).rgb * u.light.z;
 
