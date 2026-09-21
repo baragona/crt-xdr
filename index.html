@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CRT·XDR — HDR Retina CRT simulation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #gpu { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #panel {
+    position: fixed; top: 12px; right: 12px; width: 280px;
+    font: 11px/1.5 ui-monospace, Menlo, monospace; color: #cfd6cf;
+    background: rgba(10, 12, 10, 0.82); border: 1px solid #2a352a; border-radius: 8px;
+    padding: 12px 14px; backdrop-filter: blur(10px); user-select: none;
+  }
+  #panel h1 { font-size: 12px; margin: 0 0 2px; color: #7dff9a; letter-spacing: 2px; }
+  #status { color: #8a948a; margin-bottom: 8px; white-space: pre-line; }
+  #status b { color: #ffd479; font-weight: normal; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .row label { flex: 0 0 96px; color: #9fb09f; }
+  .row output { flex: 0 0 40px; text-align: right; color: #e8f0e8; }
+  input[type=range] { flex: 1; accent-color: #52d273; height: 14px; }
+  select, button {
+    background: #131a13; color: #cfe8cf; border: 1px solid #2a352a;
+    border-radius: 4px; font: inherit; padding: 2px 6px;
+  }
+  button { cursor: pointer; } button:hover { border-color: #52d273; }
+  .row.checks { justify-content: space-between; color: #9fb09f; }
+  .hint { color: #5a665a; margin-top: 8px; }
+  #err { position: fixed; inset: 0; display: none; place-content: center; text-align: center;
+         color: #ff8080; font: 14px/1.7 ui-monospace, Menlo, monospace; padding: 40px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="gpu"></canvas>
+<div id="err"></div>
+
+<div id="panel">
+  <h1>CRT·XDR</h1>
+  <div id="status">initializing…</div>
+
+  <div class="row"><label>signal</label>
+    <select id="scene">
+      <option value="terminal">terminal (P1 green)</option>
+      <option value="bars" selected>SMPTE bars</option>
+      <option value="plasma">plasma demo</option>
+      <option value="image">dropped image</option>
+    </select>
+  </div>
+  <div class="row"><label>mask</label>
+    <select id="mask">
+      <option value="1" selected>aperture grille 0.3mm</option>
+      <option value="2">aperture grille 0.6mm</option>
+      <option value="3">slot mask</option>
+      <option value="0">none</option>
+    </select>
+  </div>
+
+  <div class="row"><label>HDR peak ×</label><input id="peak" type="range" min="1" max="8" step="0.1" value="4"><output></output></div>
+  <div class="row"><label>brightness</label><input id="bright" type="range" min="0.2" max="2.5" step="0.05" value="1"><output></output></div>
+  <div class="row"><label>mask strength</label><input id="maskS" type="range" min="0" max="1" step="0.05" value="0.7"><output></output></div>
+  <div class="row"><label>beam min σ</label><input id="sigMin" type="range" min="0.1" max="0.6" step="0.01" value="0.26"><output></output></div>
+  <div class="row"><label>beam max σ</label><input id="sigMax" type="range" min="0.2" max="1" step="0.01" value="0.55"><output></output></div>
+  <div class="row"><label>h. sharpness</label><input id="sharp" type="range" min="1" max="4" step="0.1" value="1.8"><output></output></div>
+  <div class="row"><label>halation</label><input id="halation" type="range" min="0" max="0.5" step="0.01" value="0.12"><output></output></div>
+  <div class="row"><label>phosphor ms</label><input id="tau" type="range" min="1" max="60" step="1" value="8"><output></output></div>
+  <div class="row"><label>curvature</label><input id="curv" type="range" min="0" max="0.25" step="0.005" value="0.07"><output></output></div>
+  <div class="row"><label>corner r</label><input id="corner" type="range" min="0.01" max="0.2" step="0.005" value="0.06"><output></output></div>
+  <div class="row"><label>vignette</label><input id="vig" type="range" min="0" max="0.8" step="0.02" value="0.25"><output></output></div>
+
+  <div class="row checks">
+    <span><input id="rolling" type="checkbox" checked> rolling 60Hz scan</span>
+    <button id="fs">fullscreen</button>
+  </div>
+  <div class="hint">drop an image anywhere · keys 1-3 scenes · H hides panel · double-click = fullscreen</div>
+</div>
+
+<script type="module">
+'use strict';
+
+/* ---------------- source signal: a 320x240 2D canvas ---------------- */
+
+const SW = 320, SH = 240;
+const scene = document.createElement('canvas');
+scene.width = SW; scene.height = SH;
+const sctx = scene.getContext('2d', { willReadFrequently: false });
+
+const plasmaC = document.createElement('canvas');
+plasmaC.width = SW / 2; plasmaC.height = SH / 2;
+const pctx = plasmaC.getContext('2d');
+const plasmaImg = pctx.createImageData(SW / 2, SH / 2);
+
+let droppedBitmap = null;
+
+const BARS = ['#c0c0c0','#c0c000','#00c0c0','#00c000','#c000c0','#c00000','#0000c0'];
+const BARS2 = ['#0000c0','#131313','#c000c0','#131313','#00c0c0','#131313','#c0c0c0'];
+
+function drawBars(t) {
+  const w7 = SW / 7;
+  for (let i = 0; i < 7; i++) { sctx.fillStyle = BARS[i]; sctx.fillRect(i * w7, 0, w7 + 1, 160); }
+  for (let i = 0; i < 7; i++) { sctx.fillStyle = BARS2[i]; sctx.fillRect(i * w7, 160, w7 + 1, 20); }
+  sctx.fillStyle = '#0d0d0d'; sctx.fillRect(0, 180, SW, 60);
+  // PLUGE
+  sctx.fillStyle = '#000'; sctx.fillRect(10, 195, 30, 30);
+  sctx.fillStyle = '#0a0a0a'; sctx.fillRect(45, 195, 30, 30);
+  sctx.fillStyle = '#161616'; sctx.fillRect(80, 195, 30, 30);
+  sctx.fillStyle = '#fff'; sctx.fillRect(120, 195, 40, 30);
+  // gray ramp
+  for (let i = 0; i < 128; i++) {
+    const v = Math.round(i * 2);
+    sctx.fillStyle = `rgb(${v},${v},${v})`;
+    sctx.fillRect(170 + i, 195, 1, 30);
+  }
+  // bouncing white square — shows off persistence + rolling scan
+  const bx = 20 + Math.abs(((t * 90) % (2 * (SW - 52))) - (SW - 52));
+  const by = 20 + Math.abs(((t * 61) % (2 * 110)) - 110);
+  sctx.fillStyle = '#fff'; sctx.fillRect(bx, by, 12, 12);
+  sctx.fillStyle = '#fff'; sctx.font = '8px Menlo, monospace';
+  sctx.fillText('CRT·XDR 320×240 60Hz', 216, 236);
+}
+
+const BOOT = [
+  'CRT-XDR MONITOR BIOS v1.2',
+  'MEMORY TEST: 524288 BYTES OK',
+  '',
+  'PHOSPHOR ..... P22 TRIAD, 0.30MM PITCH',
+  'DEFLECTION ... 15.734 KHZ / 60.00 HZ',
+  'EDR HEADROOM . ████████ UNLOCKED',
+  'PANEL ........ 254 PPI @ 120 HZ',
+  '',
+  'ALL SYSTEMS NOMINAL.',
+  '',
+  'READY.',
+  '> RUN DEMO',
+];
+const term = { line: 0, chars: 0, t0: 0 };
+
+function drawTerminal(t) {
+  sctx.fillStyle = '#000'; sctx.fillRect(0, 0, SW, SH);
+  sctx.fillStyle = '#39ff6e'; sctx.font = '9px Menlo, monospace';
+  const cps = 40;
+  let budget = Math.floor((t - term.t0) * cps);
+  let y = 16;
+  for (let i = 0; i <= term.line && i < BOOT.length; i++) {
+    const full = BOOT[i];
+    let text = full;
+    if (i === term.line) {
+      term.chars = Math.min(full.length, budget);
+      text = full.slice(0, term.chars);
+      if (term.chars >= full.length) { term.line++; term.t0 = t + 0.25; }
+    } else {
+      budget -= full.length;
+    }
+    sctx.fillText(text, 10, y);
+    y += 12;
+  }
+  if (term.line >= BOOT.length && (t - term.t0) > 6) { term.line = 0; term.chars = 0; term.t0 = t; }
+  // blinking block cursor
+  if (Math.floor(t * 2.5) % 2 === 0) {
+    const cy = 16 + 12 * Math.min(term.line, BOOT.length - 1);
+    const cur = BOOT[Math.min(term.line, BOOT.length - 1)].slice(0, term.chars);
+    const cx = 10 + sctx.measureText(cur).width;
+    sctx.fillRect(cx + 1, cy - 8, 6, 9);
+  }
+}
+
+function drawPlasma(t) {
+  const w = SW / 2, h = SH / 2, d = plasmaImg.data;
+  let k = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const v = Math.sin(x * 0.11 + t * 1.9)
+              + Math.sin((x + y) * 0.09 + t * 1.3)
+              + Math.sin(Math.hypot(x - w / 2, y - h / 2) * 0.12 - t * 2.2);
+      const p = v * 0.5 + Math.PI * t * 0.1;
+      d[k++] = 128 + 120 * Math.sin(p);
+      d[k++] = 128 + 120 * Math.sin(p + 2.094);
+      d[k++] = 128 + 120 * Math.sin(p + 4.188);
+      d[k++] = 255;
+    }
+  }
+  pctx.putImageData(plasmaImg, 0, 0);
+  sctx.imageSmoothingEnabled = false;
+  sctx.drawImage(plasmaC, 0, 0, SW, SH);
+}
+
+function drawImage() {
+  sctx.fillStyle = '#000'; sctx.fillRect(0, 0, SW, SH);
+  if (!droppedBitmap) {
+    sctx.fillStyle = '#39ff6e'; sctx.font = '9px Menlo, monospace';
+    sctx.fillText('DROP AN IMAGE ANYWHERE', 88, 120);
+    return;
+  }
+  const s = Math.max(SW / droppedBitmap.width, SH / droppedBitmap.height);
+  const dw = droppedBitmap.width * s, dh = droppedBitmap.height * s;
+  sctx.drawImage(droppedBitmap, (SW - dw) / 2, (SH - dh) / 2, dw, dh);
+}
+
+/* ---------------- WGSL ---------------- */
+
+const WGSL = /* wgsl */`
+struct U {
+  sizes:  vec4f, // out.xy, src.zw
+  timing: vec4f, // time, dt, rolling, unused
+  beam:   vec4f, // sigmaMin, sigmaMax, hSharp, tau
+  maskp:  vec4f, // type, strength, comp, unused
+  geo:    vec4f, // curvature, cornerR, vignette, margin
+  light:  vec4f, // peak, brightness, halation, unused
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var texA: texture_2d<f32>;
+@group(0) @binding(3) var texB: texture_2d<f32>;
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  var pos = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(pos[vi], 0.0, 1.0);
+}
+
+fn fract1(x: f32) -> f32 { return x - floor(x); }
+
+// -------- phosphor persistence + rolling 60Hz beam (source resolution) ----
+// texA = fresh source frame (linear), texB = previous persistence buffer
+@fragment fn fsPersist(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let suv = fc.xy / u.sizes.zw;
+  let src  = textureSampleLevel(texA, samp, suv, 0.0).rgb;
+  let prev = textureSampleLevel(texB, samp, suv, 0.0).rgb;
+  let tau = max(u.beam.w, 0.0005);
+  let decay = exp(-u.timing.y / tau);
+  var fresh = src;
+  if (u.timing.z > 0.5) {
+    let phase  = fract1(u.timing.x * 60.0);           // beam y position, 0..1
+    let sweep  = clamp(u.timing.y * 60.0, 0.0, 1.0);  // fraction swept this frame
+    let behind = fract1(phase - suv.y);
+    let lit = select(0.0, 1.0, behind < sweep);
+    let boost = clamp(1.0 / (60.0 * tau), 1.0, 4.0);  // short glow -> hotter beam
+    fresh = src * lit * boost;
+  }
+  return vec4f(max(fresh, prev * decay), 1.0);
+}
+
+// -------- halation blur, two separable passes at source resolution --------
+fn blur(dir: vec2f, fc: vec2f) -> vec3f {
+  let px = dir / u.sizes.zw;
+  let suv = fc / u.sizes.zw;
+  var w = array<f32, 4>(0.2419, 0.1990, 0.1108, 0.0417);
+  var acc = vec3f(0.0);
+  var tot = 0.0;
+  for (var i = -3; i <= 3; i++) {
+    let wi = w[u32(abs(i))];
+    acc += textureSampleLevel(texA, samp, suv + px * f32(i) * 1.5, 0.0).rgb * wi;
+    tot += wi;
+  }
+  return acc / tot;
+}
+@fragment fn fsBlurH(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  return vec4f(blur(vec2f(1.0, 0.0), fc.xy), 1.0);
+}
+@fragment fn fsBlurV(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  return vec4f(blur(vec2f(0.0, 1.0), fc.xy), 1.0);
+}
+
+// -------- final composite at full retina resolution ------------------------
+// texA = persistence buffer, texB = halation blur
+
+fn maskPattern(fx: u32, fy: u32) -> vec3f {
+  let t = i32(u.maskp.x);
+  if (t == 1) {                       // aperture grille, 3 device px triad
+    let p = fx % 3u;
+    return vec3f(select(0.0,1.0,p==0u), select(0.0,1.0,p==1u), select(0.0,1.0,p==2u));
+  }
+  if (t == 2) {                       // coarse grille, 6 device px triad
+    let p = (fx / 2u) % 3u;
+    return vec3f(select(0.0,1.0,p==0u), select(0.0,1.0,p==1u), select(0.0,1.0,p==2u));
+  }
+  if (t == 3) {                       // slot mask
+    let p = fx % 3u;
+    let col = (fx / 3u) % 2u;
+    let yy = (fy + col * 2u) % 4u;
+    let slot = select(1.0, 0.2, yy == 0u);
+    return vec3f(select(0.0,1.0,p==0u), select(0.0,1.0,p==1u), select(0.0,1.0,p==2u)) * slot;
+  }
+  return vec3f(1.0);
+}
+
+fn encCh(x: f32) -> f32 {             // extended sRGB transfer; >1.0 = EDR
+  let a = max(x, 0.0);
+  if (a <= 0.0031308) { return 12.92 * a; }
+  return 1.055 * pow(a, 1.0 / 2.4) - 0.055;
+}
+
+@fragment fn fsComposite(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let outSize = u.sizes.xy;
+  let p = fc.xy / outSize * 2.0 - 1.0;
+
+  // fit a 4:3 tube in the window
+  let A = outSize.x / outSize.y;
+  let T = 4.0 / 3.0;
+  var c = p;
+  if (A > T) { c.x = p.x * A / T; } else { c.y = p.y * T / A; }
+  c = c / u.geo.w;
+
+  // barrel curvature
+  let k = u.geo.x;
+  let q = vec2f(c.x * (1.0 + k * c.y * c.y), c.y * (1.0 + k * 1.3 * c.x * c.x));
+
+  // rounded-rect tube edge (SDF, antialiased) — derivatives before any branch
+  let r = u.geo.y;
+  let dv = abs(q) - vec2f(1.0 - r);
+  let d = length(max(dv, vec2f(0.0))) + min(max(dv.x, dv.y), 0.0) - r;
+  let fw = fwidth(d) + 1e-5;
+  let screenA = 1.0 - smoothstep(-fw, fw, d);
+  if (screenA <= 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+
+  let suv = q * 0.5 + 0.5;
+  let srcSize = u.sizes.zw;
+
+  // horizontal: sharpened bilinear (video bandwidth)
+  let sx = suv.x * srcSize.x - 0.5;
+  let x0 = floor(sx);
+  let f  = clamp((sx - x0 - 0.5) * u.beam.z + 0.5, 0.0, 1.0);
+  let ux = (x0 + 0.5 + f) / srcSize.x;
+
+  // vertical: gaussian electron beam over the two nearest scanlines.
+  // brighter -> wider beam; energy-normalized so a narrow beam peaks >1 (EDR)
+  let H = srcSize.y;
+  let fy = suv.y * H - 0.5;
+  let l0 = floor(fy);
+  var col = vec3f(0.0);
+  for (var i = 0; i < 2; i++) {
+    let l = l0 + f32(i);
+    let inR = select(0.0, 1.0, l >= -0.5 && l <= H - 0.5);
+    let s = textureSampleLevel(texA, samp, vec2f(ux, (l + 0.5) / H), 0.0).rgb;
+    let lum = clamp(dot(s, vec3f(0.299, 0.587, 0.114)), 0.0, 1.0);
+    let sigma = mix(u.beam.x, u.beam.y, lum);
+    let dd = fy - l;
+    let w = exp(-dd * dd / (2.0 * sigma * sigma)) * (0.4 / sigma) * inR;
+    col += s * w;
+  }
+
+  // phosphor mask in device pixels + energy compensation into headroom
+  let m = maskPattern(u32(fc.x), u32(fc.y));
+  col *= mix(vec3f(1.0), m, u.maskp.y) * u.maskp.z;
+
+  // halation
+  col += textureSampleLevel(texB, samp, suv, 0.0).rgb * u.light.z;
+
+  // vignette
+  col *= clamp(1.0 - u.geo.z * 0.5 * dot(c * 0.85, c * 0.85), 0.0, 1.0);
+
+  // scale into EDR: 1.0 = SDR white, u.light.x = peak
+  col *= u.light.x * u.light.y * screenA;
+
+  return vec4f(encCh(col.r), encCh(col.g), encCh(col.b), 1.0);
+}
+`;
+
+/* ---------------- WebGPU setup ---------------- */
+
+const canvas = document.getElementById('gpu');
+const statusEl = document.getElementById('status');
+const errEl = document.getElementById('err');
+
+function fatal(msg) {
+  errEl.style.display = 'grid';
+  errEl.innerHTML = msg;
+  throw new Error(msg);
+}
+
+if (!navigator.gpu) fatal('WebGPU is not available in this browser.<br>Try Chrome or Safari 26+ on macOS.');
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) fatal('No WebGPU adapter found.');
+const device = await adapter.requestDevice();
+device.addEventListener('uncapturederror', e => { statusEl.textContent = 'GPU error: ' + e.error.message; });
+
+const context = canvas.getContext('webgpu');
+let hdrActive = false;
+let canvasFormat = 'rgba16float';
+try {
+  context.configure({
+    device, format: 'rgba16float', colorSpace: 'srgb',
+    toneMapping: { mode: 'extended' }, alphaMode: 'opaque',
+  });
+  const cfg = context.getConfiguration ? context.getConfiguration() : null;
+  hdrActive = !cfg || (cfg.toneMapping && cfg.toneMapping.mode === 'extended');
+} catch (e) {
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+  hdrActive = false;
+}
+const displayHDR = matchMedia('(dynamic-range: high)').matches;
+
+const module = device.createShaderModule({ code: WGSL });
+
+const bgl = device.createBindGroupLayout({ entries: [
+  { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+  { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+  { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+  { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+]});
+const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+
+function pipe(entryPoint, format) {
+  return device.createRenderPipeline({
+    layout, vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint, targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+}
+const pPersist = pipe('fsPersist', 'rgba16float');
+const pBlurH   = pipe('fsBlurH',   'rgba16float');
+const pBlurV   = pipe('fsBlurV',   'rgba16float');
+const pComp    = pipe('fsComposite', canvasFormat);
+
+const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+const ubuf = device.createBuffer({ size: 24 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const uarr = new Float32Array(24);
+
+function makeTex(w, h, format, extraUsage = 0) {
+  return device.createTexture({
+    size: [w, h], format,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | extraUsage,
+  });
+}
+const srcTex = makeTex(SW, SH, 'rgba8unorm-srgb', GPUTextureUsage.COPY_DST);
+const persist = [makeTex(SW, SH, 'rgba16float'), makeTex(SW, SH, 'rgba16float')];
+const blurA = makeTex(SW, SH, 'rgba16float');
+const blurB = makeTex(SW, SH, 'rgba16float');
+
+function bind(a, b) {
+  return device.createBindGroup({ layout: bgl, entries: [
+    { binding: 0, resource: { buffer: ubuf } },
+    { binding: 1, resource: sampler },
+    { binding: 2, resource: a.createView() },
+    { binding: 3, resource: b.createView() },
+  ]});
+}
+// prebuilt for both ping-pong parities
+const bgPersist = [bind(srcTex, persist[1]), bind(srcTex, persist[0])];
+const bgBlurH   = [bind(persist[0], persist[0]), bind(persist[1], persist[1])];
+const bgBlurV   = [bind(blurA, blurA), bind(blurA, blurA)];
+const bgComp    = [bind(persist[0], blurB), bind(persist[1], blurB)];
+
+/* ---------------- sizing (exact device pixels for the mask) -------------- */
+
+let needResize = true;
+new ResizeObserver(entries => {
+  const e = entries[0];
+  const s = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+  canvas._w = s ? s.inlineSize : Math.round(canvas.clientWidth * devicePixelRatio);
+  canvas._h = s ? s.blockSize : Math.round(canvas.clientHeight * devicePixelRatio);
+  needResize = true;
+}).observe(canvas);
+
+/* ---------------- UI ---------------- */
+
+const $ = id => document.getElementById(id);
+const sliders = ['peak','bright','maskS','sigMin','sigMax','sharp','halation','tau','curv','corner','vig'];
+const P = {};
+for (const id of sliders) {
+  const el = $(id), out = el.parentElement.querySelector('output');
+  const upd = () => { P[id] = parseFloat(el.value); out.value = el.value; };
+  el.addEventListener('input', upd); upd();
+}
+if (!displayHDR || !hdrActive) { $('peak').value = 1; $('peak').dispatchEvent(new Event('input')); }
+
+let sceneName = $('scene').value;
+$('scene').addEventListener('input', e => { sceneName = e.target.value; term.t0 = perfT; term.line = 0; });
+$('mask').addEventListener('input', () => {});
+$('fs').addEventListener('click', () => document.documentElement.requestFullscreen());
+canvas.addEventListener('dblclick', () => document.documentElement.requestFullscreen());
+addEventListener('keydown', e => {
+  if (e.key === 'h' || e.key === 'H') document.getElementById('panel').classList.toggle('hidden');
+  const map = { '1': 'terminal', '2': 'bars', '3': 'plasma' };
+  if (map[e.key]) { sceneName = map[e.key]; $('scene').value = sceneName; term.t0 = perfT; term.line = 0; }
+});
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', async e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) {
+    droppedBitmap = await createImageBitmap(f);
+    sceneName = 'image'; $('scene').value = 'image';
+  }
+});
+
+const MASK_AVG = { 0: 1.0, 1: 1 / 3, 2: 1 / 3, 3: 0.2708 };
+
+/* ---------------- frame loop ---------------- */
+
+let last = performance.now() / 1000, perfT = 0;
+let frames = 0, fpsT = 0, fps = 0;
+
+function frame(nowMs) {
+  const now = nowMs / 1000;
+  const dt = Math.min(Math.max(now - last, 0.0001), 0.05);
+  last = now; perfT = now;
+
+  frames++; fpsT += dt;
+  if (fpsT >= 0.5) {
+    fps = Math.round(frames / fpsT); frames = 0; fpsT = 0;
+    statusEl.innerHTML =
+      `output <b>${canvas.width}×${canvas.height}</b> @ ${devicePixelRatio}x · <b>${fps}</b> fps\n` +
+      `canvas <b>${hdrActive ? 'rgba16float · extended range' : canvasFormat + ' · SDR fallback'}</b>\n` +
+      `display ${displayHDR ? 'HDR (EDR headroom available)' : 'SDR — peak clamped'}`;
+  }
+
+  if (needResize && canvas._w) {
+    canvas.width = Math.max(canvas._w, 8);
+    canvas.height = Math.max(canvas._h, 8);
+    needResize = false;
+  }
+
+  // 1. draw the source signal
+  if (sceneName === 'bars') drawBars(now);
+  else if (sceneName === 'terminal') drawTerminal(now);
+  else if (sceneName === 'plasma') drawPlasma(now);
+  else drawImage();
+  device.queue.copyExternalImageToTexture({ source: scene }, { texture: srcTex }, [SW, SH]);
+
+  // 2. uniforms
+  const maskType = parseFloat($('mask').value);
+  const s = P.maskS;
+  const comp = 1 / (1 - s * (1 - MASK_AVG[maskType]));
+  uarr.set([
+    canvas.width, canvas.height, SW, SH,
+    now, dt, $('rolling').checked ? 1 : 0, 0,
+    P.sigMin, Math.max(P.sigMax, P.sigMin + 0.01), P.sharp, P.tau / 1000,
+    maskType, s, comp, 0,
+    P.curv, P.corner, P.vig, 0.94,
+    P.peak, P.bright, P.halation, 0,
+  ]);
+  device.queue.writeBuffer(ubuf, 0, uarr);
+
+  // 3. passes: persistence -> blur H -> blur V -> composite
+  const cur = frame.parity = 1 - (frame.parity ?? 1);
+  const enc = device.createCommandEncoder();
+  const pass = (pipeline, group, view) => {
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+    rp.setPipeline(pipeline); rp.setBindGroup(0, group); rp.draw(3); rp.end();
+  };
+  pass(pPersist, bgPersist[cur], persist[cur].createView());
+  pass(pBlurH, bgBlurH[cur], blurA.createView());
+  pass(pBlurV, bgBlurV[cur], blurB.createView());
+  pass(pComp, bgComp[cur], context.getCurrentTexture().createView());
+  device.queue.submit([enc.finish()]);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
