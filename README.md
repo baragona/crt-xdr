@@ -50,13 +50,36 @@ per-cell powder grain and halation glow around the bright square.*
 ## Build & run
 
 ```sh
-swiftc -O main.swift -o crt-xdr
+./build.sh
 ./crt-xdr
 ```
 
-Requires a Mac with an EDR-capable display (any recent MacBook Pro XDR
-panel; falls back to SDR elsewhere). Signals: SMPTE bars, green-phosphor
+Requires a Mac with Metal support and Apple's Xcode Command Line Tools
+(`xcode-select --install`). An EDR-capable display (such as a recent MacBook Pro
+XDR panel) enables HDR highlights; other displays, including the M1 MacBook Air's
+built-in display, use the SDR fallback. Signals: SMPTE bars, green-phosphor
 terminal, plasma demo, or drag any image onto the window.
+
+The build script uses the compiler and macOS SDK from the selected developer
+directory, ignores shell include-path overrides, and excludes local system
+headers that can conflict with the SDK. To select a particular Xcode installation,
+run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./build.sh`.
+An optional output path can be supplied as `./build.sh /tmp/crt-xdr`.
+
+### Troubleshooting compilation
+
+If compilation produces thousands of errors while importing Cocoa, check the
+first error. In [issue #1](https://github.com/baragona/crt-xdr/issues/1), headers
+under `/usr/local/include` shadowed the SDK's Darwin headers, producing errors
+such as `unknown type name '__int64_t'`. Use `./build.sh` to avoid those headers;
+there is no need to delete them or change the renderer.
+
+The same log also reports that the SDK is not supported by the compiler. That
+message can accompany failed SDK imports. If it persists with `./build.sh`,
+update or reinstall the Command Line Tools (or select a complete Xcode
+installation) compatible with your macOS release. For a bug report, include
+`xcode-select -p`, `xcrun --sdk macosx --show-sdk-path`, `xcrun swiftc --version`,
+and the first compiler errors.
 
 Keys: `1–4` scene · `M` mask · `R` rolling scan · `I` interlace ·
 `T` EDR test strip · `F` fullscreen · `H` hide controls

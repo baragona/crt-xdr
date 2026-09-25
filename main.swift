@@ -1,7 +1,7 @@
 // CRT·XDR — a CRT simulation for Retina HDR displays.
 // Native macOS: Metal + EDR (extended dynamic range) + 120Hz ProMotion.
 //
-// Build:  swiftc -O main.swift -o crt-xdr
+// Build:  ./build.sh
 // Run:    ./crt-xdr
 //
 // The trick: the drawable is rgba16Float in *extended linear sRGB*, with
